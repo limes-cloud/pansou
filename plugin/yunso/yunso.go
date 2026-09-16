@@ -2,6 +2,7 @@ package yunso
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"html"
@@ -26,10 +27,9 @@ const (
 	yunsoSearchAPI       = "https://www.yunso.net/api/Core/search2"
 	yunsoSearchPage      = "https://www.yunso.net/index/user/s"
 	yunsoDecryptKey      = "pWz1vnL1fTkOvTMW3f9M1jJWfneUIh50"
-	yunsoDefaultMode     = "90002"
 	yunsoDefaultScope    = "0"
-	yunsoDefaultPageSize = 20
-	yunsoDefaultMaxPages = 3
+	yunsoDefaultPageSize = 15
+	yunsoDefaultMaxPages = 1
 	yunsoDefaultTimeout  = 30 * time.Second
 )
 
@@ -37,7 +37,35 @@ var (
 	yunsoDatetimeRegex = regexp.MustCompile(`\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}`)
 	yunsoTypeCodeRegex = regexp.MustCompile(`/assets/xyso/(\d+)\.png`)
 	yunsoDecryptBytes  = []byte(yunsoDecryptKey)
+	// yunsoDefaultModes 每次搜索并发请求的模式（2026-09-15 实测：按关键词字数分流不可靠，
+	// 两种模式返回结果分布不同，固定双模式并发以覆盖更多结果）
+	yunsoDefaultModes = []string{"90001", "90002"}
+	// yunsoDefaultStypes 每次搜索并发请求的类型：1=综合，20500=夸克（对应 mapDiskType 的 TypeCode）
+	yunsoDefaultStypes = []string{"1", "20500"}
+
+	// yunsoHTTPClient 专用 HTTP 客户端：禁用 HTTP/2。
+	// 实测（2026-09-15）：yunso 前端的 Cloudflare 对数据中心 IP（如腾讯云 106）的
+	// HTTP/2 请求做指纹校验，Go 的 h2 指纹与浏览器不同会被判别为程序并强制人机验证
+	// （code:-2 需要完成人机验证，响应 89B）；HTTP/1.1 请求正常放行。
+	// 家宽 IP 下 h2 也能通过，为统一行为一律走 HTTP/1.1。
+	yunsoHTTPClient  *http.Client
+	yunsoHTTPOnce    sync.Once
 )
+
+// getYunsoHTTPClient 返回禁用 HTTP/2 的单例客户端（30s 超时）
+func getYunsoHTTPClient() *http.Client {
+	yunsoHTTPOnce.Do(func() {
+		yunsoHTTPClient = &http.Client{
+			Timeout: yunsoDefaultTimeout,
+			Transport: &http.Transport{
+				ForceAttemptHTTP2: false,
+				// 禁用 HTTP/2 协商，仅保留 HTTP/1.1
+				TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
+			},
+		}
+	})
+	return yunsoHTTPClient
+}
 
 func init() {
 	plugin.RegisterGlobalPlugin(NewYunsoAsyncPlugin())
@@ -73,8 +101,10 @@ type YunsoItem struct {
 
 // NewYunsoAsyncPlugin 创建新的小云搜索插件
 func NewYunsoAsyncPlugin() *YunsoAsyncPlugin {
+	// skipServiceFilter=true：站点结果标题多为「…黄蓉…」片段，不含完整关键词（如「黄蓉杨贵妃」），
+	// Service 层 mergeResultsByType 的标题包含过滤会将其全部丢弃，故跳过该层过滤
 	return &YunsoAsyncPlugin{
-		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin("yunso", 3),
+		BaseAsyncPlugin: plugin.NewBaseAsyncPluginWithFilter("yunso", 3, true),
 	}
 }
 
@@ -92,24 +122,31 @@ func (p *YunsoAsyncPlugin) SearchWithResult(keyword string, ext map[string]inter
 	return p.AsyncSearchWithResult(keyword, p.doSearch, p.MainCacheKey, ext)
 }
 
-// doSearch 实际搜索实现
+// doSearch 实际搜索实现：并发请求各 mode × stype（每个组合最多 yunsoDefaultMaxPages 页），合并结果。
+// 忽略框架传入的 client，统一使用禁 HTTP/2 的 yunso HTTP 客户端（见 getYunsoHTTPClient）。
 func (p *YunsoAsyncPlugin) doSearch(client *http.Client, keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
-	resultChan := make(chan []YunsoItem, yunsoDefaultMaxPages)
-	errChan := make(chan error, yunsoDefaultMaxPages)
+	requestCnt := len(yunsoDefaultModes) * len(yunsoDefaultStypes) * yunsoDefaultMaxPages
+	resultChan := make(chan []YunsoItem, requestCnt)
+	errChan := make(chan error, requestCnt)
 
+	httpClient := getYunsoHTTPClient()
 	var wg sync.WaitGroup
-	for page := 1; page <= yunsoDefaultMaxPages; page++ {
-		wg.Add(1)
-		go func(pageNum int) {
-			defer wg.Done()
+	for _, mode := range yunsoDefaultModes {
+		for _, stype := range yunsoDefaultStypes {
+			for page := 1; page <= yunsoDefaultMaxPages; page++ {
+				wg.Add(1)
+				go func(m, st string, pageNum int) {
+					defer wg.Done()
 
-			items, err := p.searchPage(client, keyword, pageNum)
-			if err != nil {
-				errChan <- fmt.Errorf("page %d search failed: %w", pageNum, err)
-				return
+					items, err := p.searchPage(httpClient, keyword, m, st, pageNum)
+					if err != nil {
+						errChan <- fmt.Errorf("mode %s stype %s page %d search failed: %w", m, st, pageNum, err)
+						return
+					}
+					resultChan <- items
+				}(mode, stype, page)
 			}
-			resultChan <- items
-		}(page)
+		}
 	}
 
 	go func() {
@@ -133,37 +170,55 @@ func (p *YunsoAsyncPlugin) doSearch(client *http.Client, keyword string, ext map
 	}
 
 	uniqueItems := p.deduplicateItems(allItems)
-	results := p.convertResults(uniqueItems)
-	return plugin.FilterResultsByKeyword(results, keyword), nil
+	// 不经过 FilterResultsByKeyword：该过滤器要求标题/内容包含完整关键词子串，
+	// 对「黄蓉杨贵妃」这类无空格中文长词会全部误滤（站内标题多为"…黄蓉…"片段），
+	// yunso 结果本身已按相关性排序，直接返回
+	return p.convertResults(uniqueItems), nil
 }
 
-func (p *YunsoAsyncPlugin) searchPage(client *http.Client, keyword string, page int) ([]YunsoItem, error) {
+// searchPage 按 mode、stype 与页码请求一页搜索结果
+func (p *YunsoAsyncPlugin) searchPage(client *http.Client, keyword, mode, stype string, page int) ([]YunsoItem, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), yunsoDefaultTimeout)
 	defer cancel()
 
 	params := url.Values{}
 	params.Set("requestID", "")
-	params.Set("mode", yunsoDefaultMode)
+	params.Set("mode", mode)
 	params.Set("scope_content", yunsoDefaultScope)
-	params.Set("stype", "")
+	params.Set("stype", stype)
 	params.Set("wd", keyword)
 	params.Set("uk", "")
 	params.Set("page", strconv.Itoa(page))
 	params.Set("limit", strconv.Itoa(yunsoDefaultPageSize))
 	params.Set("screen_filetype", "")
+	params.Set("screen_time", "")
+	params.Set("screen_size", "")
+	params.Set("screen_sortby", "")
 
+	// 与浏览器抓包对齐（2026-09-14 实测）：云服务器 IP 下缺 body 或完整浏览器头会被
+	// yunso 当作异常请求只回「聚合展示」摘要页（无 search-item），务必整组对齐。
+	// xyso_turnstile_token 为空串即可：业务参数在 query，body 只带该字段标识客户端请求。
 	searchURL := yunsoSearchAPI + "?" + params.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, searchURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, searchURL, strings.NewReader("xyso_turnstile_token="))
 	if err != nil {
 		return nil, fmt.Errorf("create request failed: %w", err)
 	}
 
 	referer := yunsoSearchPage + "?wd=" + url.QueryEscape(keyword)
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("Origin", "https://www.yunso.net")
+	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Referer", referer)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
 	resp, err := client.Do(req)

@@ -87,7 +87,9 @@ func AuthMiddleware() gin.HandlerFunc {
 		publicPaths := []string{
 			"/api/auth/login",
 			"/api/auth/logout",
-			"/api/health", // 健康检查接口可选择是否需要认证
+			"/api/health",  // 健康检查接口可选择是否需要认证
+			"/robots.txt",  // SEO：爬虫规则
+			"/sitemap.xml", // SEO：站点地图
 		}
 
 		// 检查当前路径是否是公开接口
@@ -97,6 +99,11 @@ func AuthMiddleware() gin.HandlerFunc {
 				c.Next()
 				return
 			}
+		}
+		// 落地页（SEO）始终公开
+		if path == "/" {
+			c.Next()
+			return
 		}
 
 		// 获取Authorization头

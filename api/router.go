@@ -24,7 +24,12 @@ func SetupRouter(searchService *service.SearchService) *gin.Engine {
 	r.Use(LoggerMiddleware())
 	r.Use(util.GzipMiddleware()) // 添加压缩中间件
 	r.Use(AuthMiddleware())      // 添加认证中间件
-	
+
+	// SEO 路由（供搜索引擎抓取：robots / sitemap / 落地页）
+	r.GET("/robots.txt", RobotsTxtHandler)
+	r.GET("/sitemap.xml", SitemapHandler)
+	r.GET("/", IndexHandler)
+
 	// 定义API路由组
 	api := r.Group("/api")
 	{

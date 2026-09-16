@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -96,12 +97,25 @@ func (p *YunsouAsyncPlugin) searchImpl(client *http.Client, keyword string, _ ma
 	if totalPages > maxPages {
 		totalPages = maxPages
 	}
-	for page := 2; page <= totalPages && len(results) < maxResults; page++ {
-		pageDoc, pageErr := p.fetchPage(ctx, client, keyword, page)
-		if pageErr != nil {
-			continue
+	// 剩余页并发拉取（串行翻 10 页太慢；单页失败不阻断整体，按页序合并保证结果顺序稳定）
+	if totalPages > 1 {
+		collected := make([][]model.SearchResult, totalPages+1)
+		var wg sync.WaitGroup
+		for page := 2; page <= totalPages; page++ {
+			wg.Add(1)
+			go func(pg int) {
+				defer wg.Done()
+				pageDoc, pageErr := p.fetchPage(ctx, client, keyword, pg)
+				if pageErr != nil {
+					return // 单页失败跳过，不阻断其它页
+				}
+				collected[pg] = p.parseSearchResults(pageDoc)
+			}(page)
 		}
-		results = append(results, p.parseSearchResults(pageDoc)...)
+		wg.Wait()
+		for page := 2; page <= totalPages && len(results) < maxResults; page++ {
+			results = append(results, collected[page]...)
+		}
 	}
 	if len(results) > maxResults {
 		results = results[:maxResults]

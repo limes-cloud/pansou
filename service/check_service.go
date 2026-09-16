@@ -22,6 +22,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"pansou/config"
 	"pansou/model"
 	"pansou/util"
 	utiljson "pansou/util/json"
@@ -96,11 +97,36 @@ func (s *CheckService) CheckWithProxy(items []model.CheckItem, proxyURL string) 
 		cacheScope = proxyCacheScope(proxyURL)
 	}
 
-	results := make([]model.CheckResult, 0, len(items))
+	results := make([]model.CheckResult, len(items))
 
-	for _, item := range items {
-		results = append(results, s.checkOne(item, client, cacheScope))
+	// 批量链接检测改为并发执行：每个站点的探测是独立 HTTP 请求，
+	// 并行能显著缩短整批耗时。用信号量限制并发，避免对第三方网盘站点并发过高触发风控。
+	concurrency := 5
+	if config.AppConfig != nil && config.AppConfig.CheckConcurrency > 0 {
+		concurrency = config.AppConfig.CheckConcurrency
 	}
+	if concurrency > len(items) {
+		concurrency = len(items)
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for i, item := range items {
+		wg.Add(1)
+		go func(idx int, it model.CheckItem) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// checkOne 内部已保证并发安全（内存缓存加锁、inflight 去重、bbolt 自带锁）
+			results[idx] = s.checkOne(it, client, cacheScope)
+		}(i, item)
+	}
+
+	wg.Wait()
 
 	return model.CheckResponse{
 		Results: results,
@@ -537,7 +563,8 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string, clien
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	case -9, -12:
 		return s.buildResult(item, normalized, checkStateLocked, false, "需要提取码"), nil
-	case -7, 105, 115, 117, 145:
+	case -7, -21, 105, 115, 117, 145:
+		// -21：分享已被取消（实测 /share/list 返回 "来晚啦，该分享已被取消"）
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	default:
 		return s.buildResult(item, normalized, checkStateUncertain, false, listResp.Errmsg), nil
@@ -849,16 +876,27 @@ func (s *CheckService) check115(item model.CheckItem, normalized string, client 
 	}
 
 	if response.State && response.Errno == 0 {
-		if len(response.Data.List) > 0 || response.Data.Count > 0 || response.Data.ShareInfo.SnapID != "" || response.Data.ShareInfo.ShareTitle != "" {
-			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
-		}
-
 		shareState := response.Data.ShareState
 		if shareState == 0 {
 			shareState = response.Data.ShareInfo.ShareState
 		}
 
-		if shareState == 1 {
+		// share_state 是 115 的权威状态字段，必须优先于文件列表判断。
+		// 已过期/违规等异常分享仍会返回非空 list/count（如 share_state=7
+		// 对应 forbid_reason="链接已过期"），不能仅凭文件列表判有效。
+		if shareState != 0 && shareState != 1 {
+			reason := strings.TrimSpace(response.Data.ShareInfo.ForbidReason)
+			if reason == "" {
+				reason = fmt.Sprintf("链接状态异常(share_state=%d)", shareState)
+			}
+			if containsAny(strings.ToLower(reason), []string{"密码", "提取码"}) {
+				return s.buildResult(item, normalized, checkStateLocked, false, reason), nil
+			}
+			return s.buildResult(item, normalized, checkStateBad, false, reason), nil
+		}
+
+		// 正常（share_state=1）或状态未知（0）时，再按文件列表/标题辅助确认
+		if len(response.Data.List) > 0 || response.Data.Count > 0 || response.Data.ShareInfo.SnapID != "" || response.Data.ShareInfo.ShareTitle != "" || shareState == 1 {
 			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
 		}
 
